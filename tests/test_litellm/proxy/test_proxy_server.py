@@ -4965,3 +4965,87 @@ async def test_increment_spend_counters_team_and_member():
     finally:
         ps.user_api_key_cache = original_key_cache
         ps.spend_counter_cache = original_counter_cache
+
+
+@pytest.mark.asyncio
+async def test_increment_spend_counters_uses_long_ttl_on_redis_writes():
+    """Every counter write (key, team, team_member) must carry the long
+    TTL. Redis's 60s default would expire counters mid-cycle and re-seed
+    from stale cached spend, causing budget bypass."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.constants import SPEND_COUNTER_REDIS_TTL_SECONDS
+    from litellm.proxy._types import (
+        LiteLLM_TeamTable,
+        LiteLLM_VerificationTokenView,
+        hash_token,
+    )
+
+    key_cache = DualCache()
+    counter_cache = DualCache()
+
+    hashed_token = hash_token("sk-ttl-test-token")
+    key_cache.in_memory_cache.set_cache(
+        key=hashed_token,
+        value=LiteLLM_VerificationTokenView(
+            token=hashed_token, spend=0.0, max_budget=10.0
+        ),
+    )
+    # Seed team + membership so increment_spend_counters exercises
+    # all three counter paths (key, team, team_member), not just the key.
+    key_cache.in_memory_cache.set_cache(
+        key="team_id:team-1",
+        value=LiteLLM_TeamTable(team_id="team-1", spend=0.0),
+    )
+    key_cache.in_memory_cache.set_cache(
+        key="team_membership:user-1:team-1",
+        value={"user_id": "user-1", "team_id": "team-1", "spend": 0.0},
+    )
+
+    recorded_writes: list = []
+
+    async def record_increment(key, value, ttl=None, **kwargs):
+        recorded_writes.append({"op": "increment", "key": key, "ttl": ttl})
+        return value
+
+    async def record_set(key, value, **kwargs):
+        recorded_writes.append({"op": "set", "key": key, "ttl": kwargs.get("ttl")})
+
+    fake_redis = AsyncMock()
+    fake_redis.async_increment = AsyncMock(side_effect=record_increment)
+    fake_redis.async_set_cache = AsyncMock(side_effect=record_set)
+    fake_redis.async_get_cache = AsyncMock(return_value=None)
+    counter_cache.redis_cache = fake_redis
+
+    import litellm.proxy.proxy_server as ps
+
+    original_key_cache = ps.user_api_key_cache
+    original_counter_cache = ps.spend_counter_cache
+    ps.user_api_key_cache = key_cache
+    ps.spend_counter_cache = counter_cache
+
+    try:
+        from litellm.proxy.proxy_server import increment_spend_counters
+
+        await increment_spend_counters(
+            token=hashed_token,
+            team_id="team-1",
+            user_id="user-1",
+            response_cost=0.05,
+        )
+
+        # Every write carries the long TTL.
+        for call in recorded_writes:
+            assert call["ttl"] == SPEND_COUNTER_REDIS_TTL_SECONDS, (
+                f"expected ttl={SPEND_COUNTER_REDIS_TTL_SECONDS} on every "
+                f"counter write, got ttl={call['ttl']} "
+                f"on op={call['op']} key={call['key']}"
+            )
+
+        # All three counter keys were touched.
+        keys_written = {c["key"] for c in recorded_writes}
+        assert f"spend:key:{hashed_token}" in keys_written
+        assert "spend:team:team-1" in keys_written
+        assert "spend:team_member:user-1:team-1" in keys_written
+    finally:
+        ps.user_api_key_cache = original_key_cache
+        ps.spend_counter_cache = original_counter_cache
